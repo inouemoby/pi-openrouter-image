@@ -1,0 +1,34 @@
+{
+  "name": "pi-openrouter-image",
+  "version": "0.1.0",
+  "description": "Standardized OpenRouter image generation and editing for Pi, including reference images, Muse parameters, moderation, capability discovery, and format-safe output.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "openrouter", "image", "image-generation", "muse"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/inouemoby/pi-openrouter-image.git"
+  },
+  "bugs": {
+    "url": "https://github.com/inouemoby/pi-openrouter-image/issues"
+  },
+  "homepage": "https://github.com/inouemoby/pi-openrouter-image",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.4",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@types/node": "^22.15.3",
+    "typebox": "^1.0.86",
+    "typescript": "^5.9.0"
+  }
+}
