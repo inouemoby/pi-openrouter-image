@@ -17,7 +17,7 @@ A Pi extension that standardizes OpenRouter image generation and editing through
 
 - Parameters: `n`, `aspect_ratio`, `resolution`, `size`, `quality`, `output_format`, `response_format`, `background`, `output_compression`, `seed`, `moderation`, `reasoning_strength`, `stream`, `partial_images`, `user`, provider routing, provider options, and tool enablement.
 - Local references are detected by file signature, not filename extension.
-- Returned files are saved using the actual response signature/media type. A JSON sidecar records the request, warnings, response usage, and saved paths.
+- Returned files are saved using the actual response signature/media type. Request results, usage, and warnings are returned through the tool result.
 - Dynamic model and endpoint capability checks warn when a parameter is not declared or a model does not advertise image input.
 
 ## Example

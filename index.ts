@@ -394,16 +394,7 @@ async function generate(request: ImageRequest, signal: AbortSignal | undefined):
     fs.writeFileSync(target, decoded.bytes);
     saved.push(target);
   }
-  const metadataPath = `${absoluteOutput(request.output)}.openrouter.json`;
-  fs.writeFileSync(metadataPath, JSON.stringify({
-    request: body,
-    sourceReferences: request.references ?? [],
-    warnings,
-    response: { created: response.created, usage: response.usage, output_format: response.output_format, background: response.background },
-    saved,
-    generatedAt: new Date().toISOString(),
-  }, null, 2) + "\n", "utf8");
-  return { model: request.model, saved, metadata: metadataPath, warnings, usage: response.usage, outputFormat: response.output_format };
+  return { model: request.model, saved, warnings, usage: response.usage, outputFormat: response.output_format };
 }
 
 function normalizeInput(input: ImageToolInput): ImageRequest {
