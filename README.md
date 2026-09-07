@@ -5,8 +5,9 @@ A Pi extension that standardizes OpenRouter image generation and editing through
 ## Features
 
 - `openrouter_image_generate` tool for the LLM.
-- `/openrouter-image <JSON>` command, or `/openrouter-image @request.json`.
-- `/openrouter-image-models` capability discovery.
+- Interactive `/openrouter-image` command with searchable model and parameter selectors.
+- `meta/muse-image` is the default and recommended model for both the tool and command.
+- Automatic model and endpoint capability checks before each request.
 - Correct OpenRouter reference-image shape:
 
 ```json
@@ -20,7 +21,11 @@ A Pi extension that standardizes OpenRouter image generation and editing through
 - Returned files are saved using the actual response signature/media type. Request results, usage, and warnings are returned through the tool result.
 - Dynamic model and endpoint capability checks warn when a parameter is not declared or a model does not advertise image input.
 
-## Example
+## Interactive command
+
+Run `/openrouter-image` to start an interactive wizard. It first shows a fuzzy-searchable model list, with `meta/muse-image` highlighted first as the recommended default. After the prompt editor, parameter names and legal values are loaded from the selected model's `/images/models` and endpoint capability metadata; each parameter uses the same searchable selector style. Local reference images and existing output paths are also selectable, with a custom path/URL option when enumeration is not possible.
+
+The LLM tool accepts the equivalent structured request directly:
 
 ```json
 {

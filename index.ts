@@ -1,5 +1,21 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { readStoredCredential, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  readStoredCredential,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import {
+  type Component,
+  type Focusable,
+  type SelectItem,
+  type TUI,
+  Input,
+  SelectList,
+  fuzzyFilter,
+  getKeybindings,
+  truncateToWidth,
+} from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -29,6 +45,15 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 
 type Moderation = "auto" | "low" | "none";
 type ReasoningStrength = "low" | "high";
+
+type ImageParameterSpec = {
+  type?: string;
+  values?: unknown[];
+  min?: number;
+  max?: number;
+};
+
+type SupportedParameters = Record<string, ImageParameterSpec>;
 
 type ImageRequest = {
   model: string;
@@ -70,7 +95,7 @@ type ImageModel = {
     input_modalities?: string[];
     output_modalities?: string[];
   };
-  supported_parameters?: Record<string, unknown>;
+  supported_parameters?: SupportedParameters;
   supports_streaming?: boolean;
 };
 
@@ -78,7 +103,7 @@ type Endpoint = {
   provider_name?: string;
   provider_slug?: string;
   provider_tag?: string;
-  supported_parameters?: Record<string, unknown>;
+  supported_parameters?: SupportedParameters;
   allowed_passthrough_parameters?: string[];
   supports_streaming?: boolean;
 };
@@ -212,9 +237,20 @@ async function jsonFetch<T>(url: string, init: RequestInit, signal?: AbortSignal
   return body as T;
 }
 
+async function fetchImageModels(signal?: AbortSignal): Promise<ImageModel[]> {
+  const body = await jsonFetch<ImageModelsResponse>(
+    IMAGE_MODELS_URL,
+    { headers: { Accept: "application/json" } },
+    signal,
+  );
+  return (body.data ?? [])
+    .filter((model) => Boolean(model.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
 async function discoverModel(model: string, signal?: AbortSignal): Promise<{ model?: ImageModel; endpoints: Endpoint[] }> {
-  const models = await jsonFetch<ImageModelsResponse>(IMAGE_MODELS_URL, { headers: { Accept: "application/json" } }, signal);
-  const found = models.data?.find((item) => item.id === model);
+  const models = await fetchImageModels(signal);
+  const found = models.find((item) => item.id === model);
   let endpoints: Endpoint[] = [];
   const endpointUrl = `${IMAGE_MODELS_URL}/${model.split("/").map(encodeURIComponent).join("/")}/endpoints`;
   try {
@@ -405,19 +441,549 @@ function normalizeInput(input: ImageToolInput): ImageRequest {
   } as ImageRequest;
 }
 
-function parseCommandArgs(args: string): ImageRequest {
-  const raw = args.trim();
-  if (!raw) throw new Error("Usage: /openrouter-image <JSON request> or /openrouter-image @request.json");
-  const text = raw.startsWith("@") ? fs.readFileSync(path.resolve(raw.slice(1)), "utf8") : raw;
-  return normalizeInput(JSON.parse(text) as ImageToolInput);
+const OMIT_VALUE = "__openrouter_image_omit__";
+const CUSTOM_VALUE = "__openrouter_image_custom__";
+const DONE_VALUE = "__openrouter_image_done__";
+const CUSTOM_REFERENCE_VALUE = "__openrouter_image_reference__";
+
+const IMAGE_PARAMETER_FIELDS: Record<string, string> = {
+  aspect_ratio: "aspectRatio",
+  resolution: "resolution",
+  size: "size",
+  quality: "quality",
+  output_format: "outputFormat",
+  response_format: "responseFormat",
+  background: "background",
+  output_compression: "outputCompression",
+  seed: "seed",
+  n: "n",
+  moderation: "moderation",
+  reasoning_strength: "reasoningStrength",
+  stream: "stream",
+  partial_images: "partialImages",
+};
+
+const KNOWN_PASSTHROUGH_SPECS: Record<string, ImageParameterSpec> = {
+  moderation: { type: "enum", values: ["auto", "low", "none"] },
+  response_format: { type: "enum", values: ["url", "b64_json"] },
+};
+
+const PARAMETER_ORDER = [
+  "aspect_ratio",
+  "resolution",
+  "size",
+  "quality",
+  "background",
+  "output_format",
+  "output_compression",
+  "n",
+  "input_references",
+  "seed",
+  "moderation",
+  "response_format",
+  "stream",
+  "partial_images",
+  "reasoning_strength",
+];
+
+function parameterLabel(name: string): string {
+  const labels: Record<string, string> = {
+    aspect_ratio: "Aspect ratio",
+    output_compression: "Output compression",
+    output_format: "Output format",
+    input_references: "Reference images",
+    response_format: "Response format",
+    reasoning_strength: "Reasoning strength",
+  };
+  return labels[name] ?? name.replaceAll("_", " ");
+}
+
+function parameterDescription(name: string, spec: ImageParameterSpec): string {
+  if (spec.type === "enum" && Array.isArray(spec.values)) {
+    return `Legal values: ${spec.values.map(String).join(", ")}`;
+  }
+  if (spec.type === "range" && typeof spec.min === "number" && typeof spec.max === "number") {
+    return `Legal range: ${spec.min}–${spec.max}`;
+  }
+  if (name === "seed") return "The provider supports a caller-supplied integer seed.";
+  if (name === "input_references") return "Image input is supported, but the provider did not publish a reference-count range.";
+  return "Provider-specific parameter; enter a value if needed.";
+}
+
+class FilterSelectComponent implements Component, Focusable {
+  private readonly searchInput = new Input();
+  private readonly allItems: SelectItem[];
+  private filteredItems: SelectItem[];
+  private list: SelectList;
+  private focusedState = false;
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly title: string,
+    items: SelectItem[],
+    private readonly done: (value: string | null) => void,
+  ) {
+    this.allItems = items;
+    this.filteredItems = items;
+    this.list = this.createList(items);
+  }
+
+  get focused(): boolean {
+    return this.focusedState;
+  }
+
+  set focused(value: boolean) {
+    this.focusedState = value;
+    this.searchInput.focused = value;
+  }
+
+  private createList(items: SelectItem[]): SelectList {
+    const list = new SelectList(items, Math.min(Math.max(items.length, 1), 10), {
+      selectedPrefix: (text) => this.theme.fg("accent", text),
+      selectedText: (text) => this.theme.fg("accent", text),
+      description: (text) => this.theme.fg("muted", text),
+      scrollInfo: (text) => this.theme.fg("dim", text),
+      noMatch: (text) => this.theme.fg("warning", text),
+    });
+    list.onSelect = (item) => this.done(item.value);
+    list.onCancel = () => this.done(null);
+    return list;
+  }
+
+  private refilter(): void {
+    const query = this.searchInput.getValue().trim();
+    this.filteredItems = query
+      ? fuzzyFilter(this.allItems, query, (item) => `${item.value} ${item.label} ${item.description ?? ""}`)
+      : this.allItems;
+    this.list = this.createList(this.filteredItems);
+  }
+
+  handleInput(data: string): void {
+    const keybindings = getKeybindings();
+    if (
+      keybindings.matches(data, "tui.select.up")
+      || keybindings.matches(data, "tui.select.down")
+      || keybindings.matches(data, "tui.select.confirm")
+    ) {
+      this.list.handleInput(data);
+    } else if (keybindings.matches(data, "tui.select.cancel")) {
+      this.done(null);
+    } else {
+      this.searchInput.handleInput(data);
+      this.refilter();
+    }
+    this.tui.requestRender();
+  }
+
+  render(width: number): string[] {
+    const count = `${this.filteredItems.length}/${this.allItems.length} matching`;
+    return [
+      truncateToWidth(this.theme.fg("accent", this.theme.bold(this.title)), width),
+      ...this.searchInput.render(width),
+      "",
+      ...this.list.render(width),
+      this.theme.fg("dim", truncateToWidth(`${count} • type to filter • ↑↓ select • Enter confirm • Esc cancel`, width)),
+    ];
+  }
+
+  invalidate(): void {
+    this.searchInput.invalidate();
+    this.list.invalidate();
+  }
+}
+
+async function selectFromFilteredList(
+  ctx: ExtensionCommandContext,
+  title: string,
+  items: SelectItem[],
+): Promise<string | null> {
+  if (ctx.mode !== "tui") {
+    throw new Error("/openrouter-image requires Pi's interactive TUI mode.");
+  }
+  const result = await ctx.ui.custom<string | null>(
+    (tui, theme, _keybindings, done) => new FilterSelectComponent(tui, theme, title, items, done),
+  );
+  return result ?? null;
+}
+
+async function askRequiredInput(
+  ctx: ExtensionCommandContext,
+  title: string,
+  placeholder: string,
+): Promise<string | undefined> {
+  while (true) {
+    const answer = await ctx.ui.input(title, placeholder);
+    if (answer === undefined) return undefined;
+    const trimmed = answer.trim();
+    if (trimmed) return trimmed;
+    ctx.ui.notify(`${title} cannot be empty.`, "warning");
+  }
+}
+
+async function askRequiredEditor(
+  ctx: ExtensionCommandContext,
+  title: string,
+): Promise<string | undefined> {
+  while (true) {
+    const answer = await ctx.ui.editor(title, "");
+    if (answer === undefined) return undefined;
+    const trimmed = answer.trim();
+    if (trimmed) return trimmed;
+    ctx.ui.notify(`${title} cannot be empty.`, "warning");
+  }
+}
+
+function parseInteger(value: string, label: string, min?: number, max?: number): number {
+  const parsed = Number(value.trim());
+  if (
+    !Number.isSafeInteger(parsed)
+    || (min !== undefined && parsed < min)
+    || (max !== undefined && parsed > max)
+  ) {
+    const range = min !== undefined && max !== undefined
+      ? ` between ${min} and ${max}`
+      : min !== undefined
+        ? ` greater than or equal to ${min}`
+        : max !== undefined
+          ? ` less than or equal to ${max}`
+          : "";
+    throw new Error(`${label} must be a whole number${range}.`);
+  }
+  return parsed;
+}
+
+function modelSelectItems(models: ImageModel[]): SelectItem[] {
+  return [...models]
+    .sort((a, b) => {
+      if (a.id === DEFAULT_MODEL) return -1;
+      if (b.id === DEFAULT_MODEL) return 1;
+      return a.id.localeCompare(b.id);
+    })
+    .map((model) => {
+      const input = model.architecture?.input_modalities?.join(", ") || "?";
+      const output = model.architecture?.output_modalities?.join(", ") || "?";
+      const isRecommended = model.id === DEFAULT_MODEL;
+      return {
+        value: model.id,
+        label: isRecommended ? `★ ${model.id} (recommended)` : model.id,
+        description: `${model.name ?? model.id} • ${input} → ${output}${isRecommended ? " • default" : ""}`,
+      };
+    });
+}
+
+function getParameterSpecs(discovery: { model?: ImageModel; endpoints: Endpoint[] }): Map<string, ImageParameterSpec> {
+  const endpoint = discovery.endpoints[0];
+  const endpointSpecs = endpoint?.supported_parameters;
+  const modelSpecs = discovery.model?.supported_parameters;
+  const source = endpointSpecs && Object.keys(endpointSpecs).length > 0 ? endpointSpecs : modelSpecs ?? {};
+  const specs = new Map(Object.entries(source));
+
+  for (const name of endpoint?.allowed_passthrough_parameters ?? []) {
+    if (!specs.has(name)) specs.set(name, KNOWN_PASSTHROUGH_SPECS[name] ?? { type: "custom" });
+  }
+  if (!specs.has("input_references") && discovery.model?.architecture?.input_modalities?.includes("image")) {
+    specs.set("input_references", { type: "custom" });
+  }
+  if (endpoint?.supports_streaming && !specs.has("stream")) {
+    specs.set("stream", { type: "enum", values: [true] });
+  }
+  return specs;
+}
+
+function sortedParameterNames(specs: Map<string, ImageParameterSpec>): string[] {
+  return [...specs.keys()].sort((a, b) => {
+    const aOrder = PARAMETER_ORDER.indexOf(a);
+    const bOrder = PARAMETER_ORDER.indexOf(b);
+    if (aOrder !== -1 && bOrder !== -1) return aOrder - bOrder;
+    if (aOrder !== -1) return -1;
+    if (bOrder !== -1) return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function parameterSelectItems(specs: Map<string, ImageParameterSpec>): SelectItem[] {
+  const items = sortedParameterNames(specs).map((name) => ({
+    value: name,
+    label: parameterLabel(name),
+    description: `${name} • ${parameterDescription(name, specs.get(name)!)}`,
+  }));
+  items.push({
+    value: DONE_VALUE,
+    label: "Done — generate image",
+    description: "Finish parameter selection and continue to the output path.",
+  });
+  return items;
+}
+
+function parameterValueItems(name: string, spec: ImageParameterSpec): SelectItem[] {
+  const items: SelectItem[] = [{
+    value: OMIT_VALUE,
+    label: "Use provider default",
+    description: "Do not send this parameter.",
+  }];
+
+  if (spec.type === "enum" && Array.isArray(spec.values)) {
+    items.push(...spec.values.map((value) => ({
+      value: String(value),
+      label: String(value),
+    })));
+    return items;
+  }
+
+  if (
+    spec.type === "range"
+    && Number.isSafeInteger(spec.min)
+    && Number.isSafeInteger(spec.max)
+    && spec.min !== undefined
+    && spec.max !== undefined
+    && spec.max >= spec.min
+    && spec.max - spec.min <= 1000
+  ) {
+    for (let value = spec.min; value <= spec.max; value++) {
+      items.push({ value: String(value), label: String(value) });
+    }
+    return items;
+  }
+
+  if (spec.type === "boolean" && name !== "seed") {
+    items.push({ value: "true", label: "true" }, { value: "false", label: "false" });
+    return items;
+  }
+
+  items.push({
+    value: CUSTOM_VALUE,
+    label: "Enter a custom value…",
+    description: name === "seed"
+      ? "The provider accepts an integer seed."
+      : "This provider parameter has no finite value list.",
+  });
+  return items;
+}
+
+type ValueChoice =
+  | { cancelled: true }
+  | { cancelled: false; omitted: true }
+  | { cancelled: false; omitted: false; value: unknown };
+
+function decodeSelectedValue(name: string, spec: ImageParameterSpec, value: string): unknown {
+  const original = spec.values?.find((candidate) => String(candidate) === value);
+  if (original !== undefined) return original;
+  if (spec.type === "range") return parseInteger(value, parameterLabel(name), spec.min, spec.max);
+  if (spec.type === "boolean") return value === "true";
+  return value;
+}
+
+function decodeCustomValue(name: string, value: string): unknown {
+  if (name === "seed") return parseInteger(value, "Seed");
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+async function chooseParameterValue(
+  ctx: ExtensionCommandContext,
+  name: string,
+  spec: ImageParameterSpec,
+): Promise<ValueChoice> {
+  const selected = await selectFromFilteredList(ctx, `${parameterLabel(name)} — select a value`, parameterValueItems(name, spec));
+  if (selected === null) return { cancelled: true };
+  if (selected === OMIT_VALUE) return { cancelled: false, omitted: true };
+  if (selected === CUSTOM_VALUE) {
+    const raw = await askRequiredInput(ctx, `${parameterLabel(name)} value`, "Enter a value");
+    if (raw === undefined) return { cancelled: true };
+    return { cancelled: false, omitted: false, value: decodeCustomValue(name, raw) };
+  }
+  return { cancelled: false, omitted: false, value: decodeSelectedValue(name, spec, selected) };
+}
+
+function setRequestParameter(request: ImageToolInput, name: string, value: unknown): void {
+  if (name === "input_references") return;
+  const field = IMAGE_PARAMETER_FIELDS[name];
+  if (field) {
+    (request as unknown as Record<string, unknown>)[field] = value;
+    return;
+  }
+  request.extraParams = { ...(request.extraParams ?? {}), [name]: value };
+}
+
+function clearRequestParameter(request: ImageToolInput, name: string): void {
+  if (name === "input_references") {
+    request.references = undefined;
+    return;
+  }
+  const field = IMAGE_PARAMETER_FIELDS[name];
+  if (field) {
+    delete (request as unknown as Record<string, unknown>)[field];
+    return;
+  }
+  if (request.extraParams) {
+    const extraParams = { ...request.extraParams };
+    delete extraParams[name];
+    request.extraParams = extraParams;
+  }
+}
+
+function listLocalReferenceFiles(root: string, maxFiles = 200): string[] {
+  const result: string[] = [];
+  const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"]);
+  const ignoredDirectories = new Set([".git", ".pi", "node_modules", "dist", "build"]);
+
+  const visit = (directory: string, depth: number) => {
+    if (depth > 4 || result.length >= maxFiles) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (result.length >= maxFiles) return;
+      if (entry.name.startsWith(".") && entry.isDirectory()) continue;
+      if (entry.isDirectory()) {
+        if (!ignoredDirectories.has(entry.name)) visit(path.join(directory, entry.name), depth + 1);
+      } else if (entry.isFile() && imageExtensions.has(path.extname(entry.name).toLowerCase())) {
+        result.push(path.join(directory, entry.name));
+      }
+    }
+  };
+
+  visit(root, 0);
+  return result;
+}
+
+async function chooseReferences(ctx: ExtensionCommandContext, count: number): Promise<string[] | null> {
+  if (count === 0) return [];
+  const selected: string[] = [];
+  const available = listLocalReferenceFiles(ctx.cwd);
+
+  for (let index = 0; index < count; index++) {
+    const items: SelectItem[] = available
+      .filter((file) => !selected.includes(file))
+      .map((file) => ({
+        value: file,
+        label: path.relative(ctx.cwd, file) || file,
+        description: "Local reference image",
+      }));
+    items.push({
+      value: CUSTOM_REFERENCE_VALUE,
+      label: "Enter a local path or URL…",
+      description: "Use this for a file outside the workspace or an HTTP(S) URL.",
+    });
+
+    const choice = await selectFromFilteredList(ctx, `Reference image ${index + 1}/${count}`, items);
+    if (choice === null) return null;
+    if (choice === CUSTOM_REFERENCE_VALUE) {
+      const reference = await askRequiredInput(ctx, "Reference image path or URL", "C:/path/to/image.png or https://...");
+      if (reference === undefined) return null;
+      selected.push(reference);
+    } else {
+      selected.push(choice);
+    }
+  }
+  return selected;
+}
+
+async function chooseOutputPath(ctx: ExtensionCommandContext): Promise<string | undefined> {
+  const items: SelectItem[] = listLocalReferenceFiles(ctx.cwd).map((file) => ({
+    value: file,
+    label: path.relative(ctx.cwd, file) || file,
+    description: "Use this existing path and choose whether to overwrite it.",
+  }));
+  items.push({
+    value: CUSTOM_REFERENCE_VALUE,
+    label: "Enter a new output path…",
+    description: "Create a new image file at a custom path.",
+  });
+
+  const choice = await selectFromFilteredList(ctx, "Select output path", items);
+  if (choice === null) return undefined;
+  if (choice === CUSTOM_REFERENCE_VALUE) {
+    return askRequiredInput(ctx, "Output file path", "C:/path/to/output.png");
+  }
+  return choice;
+}
+
+async function configureImageParameters(
+  ctx: ExtensionCommandContext,
+  request: ImageToolInput,
+  discovery: { model?: ImageModel; endpoints: Endpoint[] },
+): Promise<boolean> {
+  const specs = getParameterSpecs(discovery);
+  while (true) {
+    const selected = await selectFromFilteredList(ctx, "Select an image parameter", parameterSelectItems(specs));
+    if (selected === null) return false;
+    if (selected === DONE_VALUE) return true;
+
+    const spec = specs.get(selected);
+    if (!spec) continue;
+    const choice = await chooseParameterValue(ctx, selected, spec);
+    if (choice.cancelled) return false;
+    if (choice.omitted) {
+      clearRequestParameter(request, selected);
+      continue;
+    }
+
+    if (selected === "input_references") {
+      const count = parseInteger(String(choice.value), "Reference image count", 0);
+      const references = await chooseReferences(ctx, count);
+      if (references === null) return false;
+      request.references = references.length ? references : undefined;
+    } else {
+      setRequestParameter(request, selected, choice.value);
+    }
+  }
+}
+
+async function promptForImageRequest(ctx: ExtensionCommandContext): Promise<ImageRequest | undefined> {
+  if (!ctx.hasUI || ctx.mode !== "tui") {
+    ctx.ui.notify("/openrouter-image requires Pi's interactive TUI mode.", "error");
+    return undefined;
+  }
+
+  const models = await fetchImageModels(ctx.signal);
+  if (models.length === 0) throw new Error("OpenRouter returned no image models.");
+  const model = await selectFromFilteredList(ctx, "Select an OpenRouter image model", modelSelectItems(models));
+  if (model === null) return undefined;
+
+  const prompt = await askRequiredEditor(ctx, "Image prompt");
+  if (prompt === undefined) return undefined;
+
+  const discovery = await discoverModel(model, ctx.signal);
+  const request: ImageToolInput = { model, prompt, output: "" };
+  if (!await configureImageParameters(ctx, request, discovery)) return undefined;
+
+  const output = await chooseOutputPath(ctx);
+  if (output === undefined) return undefined;
+  request.output = output;
+
+  const overwrite = await selectFromFilteredList(ctx, "Overwrite existing output files?", [
+    {
+      value: "false",
+      label: "Do not overwrite",
+      description: "Fail if the generated output path already exists.",
+    },
+    {
+      value: "true",
+      label: "Overwrite existing files",
+      description: "Replace an existing generated output file.",
+    },
+  ]);
+  if (overwrite === null) return undefined;
+  request.overwrite = overwrite === "true";
+
+  return normalizeInput(request);
 }
 
 export default function piOpenRouterImage(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "openrouter_image_generate",
     label: "OpenRouter Image",
-    description: "Generate or edit images through OpenRouter's standardized /api/v1/images API. Supports local/URL reference images, input_references, Muse options, moderation, provider routing, output format validation, capability warnings, and a JSON sidecar.",
-    promptSnippet: "Generate or edit an image with OpenRouter using explicit model parameters and optional reference images",
+    description: "Generate or edit images through OpenRouter's standardized /api/v1/images API. The default and recommended model is meta/muse-image. Supports local/URL reference images, input_references, Muse options, moderation, provider routing, output format validation, and capability warnings with request metadata in the tool result.",
+    promptSnippet: "Generate or edit an image with OpenRouter; default/recommended model: meta/muse-image",
     parameters: imageToolSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const result = await generate(normalizeInput(params), signal);
@@ -429,29 +995,21 @@ export default function piOpenRouterImage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("openrouter-image", {
-    description: "Generate/edit an OpenRouter image from a JSON request; use @file.json for a request file",
-    handler: async (args, ctx) => {
+    description: "Interactively generate or edit an OpenRouter image",
+    handler: async (_args, ctx) => {
       try {
-        const result = await generate(parseCommandArgs(String(args || "")), ctx.signal);
+        const request = await promptForImageRequest(ctx);
+        if (!request) {
+          ctx.ui.notify("OpenRouter image cancelled.", "info");
+          return;
+        }
+        const result = await generate(request, ctx.signal);
         if (Array.isArray(result.warnings) && result.warnings.length) {
           ctx.ui.notify(result.warnings.join("\n"), "warning");
         }
         ctx.ui.notify(JSON.stringify(result, null, 2), "info");
       } catch (error: any) {
         ctx.ui.notify(`OpenRouter image: ${error?.message || String(error)}`, "error");
-      }
-    },
-  });
-
-  pi.registerCommand("openrouter-image-models", {
-    description: "List OpenRouter image models and endpoint capabilities",
-    handler: async (_args, ctx) => {
-      try {
-        const body = await jsonFetch<ImageModelsResponse>(IMAGE_MODELS_URL, { headers: { Accept: "application/json" } }, ctx.signal);
-        const rows = (body.data ?? []).map((model) => `${model.id} | input:${model.architecture?.input_modalities?.join(",") || "?"} | params:${Object.keys(model.supported_parameters ?? {}).join(",") || "none"}`);
-        ctx.ui.notify(rows.length ? rows.join("\n") : "No OpenRouter image models returned.", "info");
-      } catch (error: any) {
-        ctx.ui.notify(`OpenRouter image models: ${error?.message || String(error)}`, "error");
       }
     },
   });
