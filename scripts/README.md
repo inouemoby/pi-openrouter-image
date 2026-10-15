@@ -1,0 +1,6 @@
+# Validation entries
+
+- `compatibility.test.mjs`: called by `npm test`; loads the extension with Pi's loader and checks tool registration, structured results, reference redaction, provider filtering, discovery failures, protected request fields, saved output, cancellation, and concurrent no-overwrite writes. HTTP responses are simulated. Temporary reference/output fixtures are created under `~/Temp/` and removed on completion. This does not establish live model availability or image quality.
+- `inspect.mjs`: read-only CLI for live model/endpoint discovery and reference conversion through the registered tool's dry-run path. Usage: `node scripts/inspect.mjs <model> <provider> <reference-path-or-url> <output-path>`. It uses Pi's model runtime to resolve authentication, prints credential presence/type and provider IDs without keys, and prints structured metadata with inline image data omitted. It sends authenticated discovery GET requests and neither generates images nor writes the requested output. It does not establish successful generation or transparency support.
+
+Both entries accept `PI_TEST_HOST_ENTRY` pointing to an installed Pi's `dist/index.js`; otherwise they use the development dependency. `npm run check` separately checks `index.ts` against development dependency types.

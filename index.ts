@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  readStoredCredential,
+  withFileMutationQueue,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type Theme,
@@ -19,6 +19,7 @@ import {
 import { Type, type Static } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resolveImageApiKey } from "./credentials.ts";
 
 const API_BASE = "https://openrouter.ai/api/v1";
 const IMAGES_URL = `${API_BASE}/images`;
@@ -125,6 +126,21 @@ type ImageResponse = {
 
 type ImageToolInput = Static<typeof imageToolSchema>;
 
+const imageResultSchema = Type.Object({
+  model: Type.String(),
+  warnings: Type.Array(Type.String()),
+  dryRun: Type.Optional(Type.Boolean()),
+  request: Type.Optional(Type.Record(Type.String(), Type.Any())),
+  modelCapabilities: Type.Optional(Type.Any()),
+  endpoints: Type.Optional(Type.Array(Type.Any())),
+  discoveryError: Type.Optional(Type.String()),
+  saved: Type.Optional(Type.Array(Type.String())),
+  usage: Type.Optional(Type.Record(Type.String(), Type.Any())),
+  outputFormat: Type.Optional(Type.String()),
+});
+
+type ImageGenerationResult = Static<typeof imageResultSchema>;
+
 const imageToolSchema = Type.Object({
   model: Type.Optional(Type.String({ description: `OpenRouter image model ID. Default: ${DEFAULT_MODEL}` })),
   prompt: Type.String({ description: "The image generation or editing instruction." }),
@@ -156,31 +172,6 @@ const imageToolSchema = Type.Object({
   overwrite: Type.Optional(Type.Boolean()),
   dryRun: Type.Optional(Type.Boolean()),
 });
-
-function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR
-    || path.join(process.env.USERPROFILE || process.env.HOME || ".", ".pi", "agent");
-}
-
-function readApiKey(): string {
-  if (process.env.OPENROUTER_API_KEY?.trim()) return process.env.OPENROUTER_API_KEY.trim();
-  try {
-    const credential = readStoredCredential("openrouter");
-    if (credential?.type === "api_key" && credential.key) return credential.key;
-    if (credential?.type === "oauth" && credential.access) return credential.access;
-  } catch {
-    // Use auth.json fallback below.
-  }
-  try {
-    const auth = JSON.parse(fs.readFileSync(path.join(getAgentDir(), "auth.json"), "utf8"));
-    const credential = auth.openrouter;
-    if (credential?.type === "api_key" && typeof credential.key === "string") return credential.key;
-    if (credential?.type === "oauth" && typeof credential.access === "string") return credential.access;
-  } catch {
-    // No credential configured.
-  }
-  return "";
-}
 
 function absoluteOutput(output: string): string {
   return path.resolve(output);
@@ -237,10 +228,10 @@ async function jsonFetch<T>(url: string, init: RequestInit, signal?: AbortSignal
   return body as T;
 }
 
-async function fetchImageModels(signal?: AbortSignal): Promise<ImageModel[]> {
+async function fetchImageModels(signal?: AbortSignal, key?: string): Promise<ImageModel[]> {
   const body = await jsonFetch<ImageModelsResponse>(
     IMAGE_MODELS_URL,
-    { headers: { Accept: "application/json" } },
+    { headers: { Accept: "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) } },
     signal,
   );
   return (body.data ?? [])
@@ -248,18 +239,58 @@ async function fetchImageModels(signal?: AbortSignal): Promise<ImageModel[]> {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-async function discoverModel(model: string, signal?: AbortSignal): Promise<{ model?: ImageModel; endpoints: Endpoint[] }> {
-  const models = await fetchImageModels(signal);
+type ModelDiscovery = {
+  model?: ImageModel;
+  endpoints: Endpoint[];
+  discoveryError?: string;
+};
+
+async function discoverModel(model: string, signal?: AbortSignal, key?: string): Promise<ModelDiscovery> {
+  const models = await fetchImageModels(signal, key);
   const found = models.find((item) => item.id === model);
   let endpoints: Endpoint[] = [];
   const endpointUrl = `${IMAGE_MODELS_URL}/${model.split("/").map(encodeURIComponent).join("/")}/endpoints`;
   try {
-    const detail = await jsonFetch<EndpointsResponse>(endpointUrl, { headers: { Accept: "application/json" } }, signal);
+    const detail = await jsonFetch<EndpointsResponse>(endpointUrl, {
+      headers: { Accept: "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+    }, signal);
     endpoints = detail.endpoints ?? [];
-  } catch {
-    // Model list is still useful if endpoint discovery is unavailable.
+  } catch (error) {
+    signal?.throwIfAborted();
+    return {
+      model: found,
+      endpoints,
+      discoveryError: error instanceof Error ? error.message : String(error),
+    };
   }
   return { model: found, endpoints };
+}
+
+function eligibleEndpoints(request: ImageRequest, endpoints: Endpoint[]): Endpoint[] {
+  const matches = (endpoint: Endpoint, provider: string) => [
+    endpoint.provider_tag,
+    endpoint.provider_slug,
+    endpoint.provider_name,
+  ].some((value) => value?.toLowerCase() === provider.toLowerCase());
+
+  return endpoints.filter((endpoint) => {
+    if (request.providerOnly?.length && !request.providerOnly.some((provider) => matches(endpoint, provider))) {
+      return false;
+    }
+    return !request.providerIgnore?.some((provider) => matches(endpoint, provider));
+  });
+}
+
+function summarizeRequest(body: Record<string, unknown>): Record<string, unknown> {
+  // Never persist reference image payloads in tool content, details, or codemode results.
+  return JSON.parse(JSON.stringify(body, (_key, value) => {
+    if (typeof value === "string" && /^data:/i.test(value)) {
+      const comma = value.indexOf(",");
+      const header = comma < 0 ? "data:" : value.slice(0, comma);
+      return `${header},[omitted ${value.length - comma - 1} characters]`;
+    }
+    return value;
+  }));
 }
 
 function buildBody(request: ImageRequest, references: string[]): Record<string, unknown> {
@@ -303,7 +334,18 @@ function buildBody(request: ImageRequest, references: string[]): Record<string, 
     };
   }
   if (request.toolEnablement) body.tool_enablement = request.toolEnablement;
-  if (request.extraParams) Object.assign(body, request.extraParams);
+  if (request.extraParams) {
+    const reserved = new Set([
+      "model", "prompt", "provider", "input_references", "tool_enablement",
+      "n", "aspect_ratio", "resolution", "size", "quality", "output_format",
+      "response_format", "background", "output_compression", "seed", "moderation",
+      "reasoning_strength", "stream", "partial_images", "user",
+    ]);
+    for (const [key, value] of Object.entries(request.extraParams)) {
+      if (reserved.has(key)) throw new Error(`Use the dedicated tool field instead of extraParams.${key}.`);
+      body[key] = value;
+    }
+  }
   return body;
 }
 
@@ -313,8 +355,13 @@ function capabilityWarnings(request: ImageRequest, model: ImageModel | undefined
   if (request.references?.length && !model?.architecture?.input_modalities?.includes("image")) {
     warnings.push("This model does not advertise image input; references may be ignored.");
   }
-  const endpoint = endpoints[0];
-  const declared = new Set(Object.keys(endpoint?.supported_parameters ?? model?.supported_parameters ?? {}));
+  const selected = eligibleEndpoints(request, endpoints);
+  const declared = new Set(selected.flatMap((endpoint) => Object.keys(endpoint.supported_parameters ?? {})));
+  if (!endpoints.length) {
+    warnings.push("No image endpoints were returned for this model; provider availability is unconfirmed.");
+  } else if (!selected.length) {
+    warnings.push("No discovered image endpoint matches the requested provider restrictions.");
+  }
   const standard = [
     ["aspectRatio", "aspect_ratio"], ["resolution", "resolution"], ["size", "size"],
     ["quality", "quality"], ["outputFormat", "output_format"], ["background", "background"],
@@ -326,14 +373,17 @@ function capabilityWarnings(request: ImageRequest, model: ImageModel | undefined
     }
   }
   if (request.references?.length && request.model === "meta/muse-image") {
-    warnings.push("Muse reference editing is advertised by the model, but the current Meta endpoint exposes no detailed image-parameter schema; verify identity preservation in the output.");
+    warnings.push("Muse reference input does not guarantee identity or style preservation; inspect the generated image.");
+  }
+  if (request.stream && selected.length && !selected.some((endpoint) => endpoint.supports_streaming)) {
+    warnings.push("The selected endpoints do not advertise streaming support.");
   }
   const requestedConfig = [
     request.aspectRatio, request.resolution, request.size, request.quality,
     request.outputFormat, request.responseFormat, request.background,
     request.outputCompression, request.seed, request.n,
   ].some((value) => value !== undefined);
-  if (requestedConfig && endpoints.length && declared.size === 0) {
+  if (requestedConfig && declared.size === 0) {
     warnings.push("The selected image endpoint publishes no detailed parameter schema; configuration fields are sent but may be ignored by the upstream provider.");
   }
   if (request.moderation === "none") {
@@ -358,10 +408,10 @@ function outputPathFor(output: string, index: number, total: number, extension: 
   return total === 1 ? `${stem}${extension}` : `${stem}-${index + 1}${extension}`;
 }
 
-async function decodeResult(result: ImageResult): Promise<{ bytes: Uint8Array; mediaType?: string }> {
+async function decodeResult(result: ImageResult, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mediaType?: string }> {
   if (result.b64_json) return { bytes: Buffer.from(result.b64_json, "base64"), mediaType: result.media_type };
   if (result.url) {
-    const response = await fetch(result.url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    const response = await fetch(result.url, { signal: timeoutSignal(signal) });
     if (!response.ok) throw new Error(`Generated image download failed: HTTP ${response.status}`);
     return { bytes: new Uint8Array(await response.arrayBuffer()), mediaType: result.media_type || response.headers.get("content-type") || undefined };
   }
@@ -405,14 +455,28 @@ async function requestImageResponse(body: Record<string, unknown>, key: string, 
   return { data: completed, usage };
 }
 
-async function generate(request: ImageRequest, signal: AbortSignal | undefined): Promise<Record<string, unknown>> {
+async function generate(request: ImageRequest, signal: AbortSignal | undefined, key: string): Promise<ImageGenerationResult> {
   const references = [];
   for (const reference of request.references ?? []) references.push(await referenceToDataUrl(reference));
-  const discovery = await discoverModel(request.model, signal);
+  const discovery = await discoverModel(request.model, signal, key);
   const warnings = capabilityWarnings(request, discovery.model, discovery.endpoints);
+  if (discovery.discoveryError) warnings.push(`Endpoint discovery failed: ${discovery.discoveryError}`);
   const body = buildBody(request, references);
-  if (request.dryRun) return { dryRun: true, request: body, warnings, model: discovery.model, endpoints: discovery.endpoints };
-  const key = readApiKey();
+  if (request.dryRun) {
+    return {
+      dryRun: true,
+      model: request.model,
+      request: summarizeRequest(body),
+      warnings,
+      modelCapabilities: discovery.model,
+      endpoints: discovery.endpoints,
+      discoveryError: discovery.discoveryError,
+    };
+  }
+  if (request.providerOnly?.length && !eligibleEndpoints(request, discovery.endpoints).length) {
+    throw new Error(`No discovered endpoint for ${request.model} matches providerOnly: ${request.providerOnly.join(", ")}. No generation request was sent.`);
+  }
+  signal?.throwIfAborted();
   if (!key) throw new Error("No OpenRouter API key found. Run /login openrouter or set OPENROUTER_API_KEY.");
   const response = await requestImageResponse(body, key, signal);
   const images = response.data ?? [];
@@ -420,14 +484,16 @@ async function generate(request: ImageRequest, signal: AbortSignal | undefined):
   const saved: string[] = [];
   const requested = request.outputFormat ? `.${request.outputFormat}` : request.output;
   for (let index = 0; index < images.length; index++) {
-    const decoded = await decodeResult(images[index]);
+    const decoded = await decodeResult(images[index], signal);
     const mediaType = detectImageType(decoded.bytes) || decoded.mediaType;
     if (!mediaType) throw new Error(`Generated image ${index + 1} has an unrecognized file signature.`);
     const extension = extensionForMedia(mediaType, decoded.bytes, requested);
     const target = outputPathFor(request.output, index, images.length, extension);
-    if (fs.existsSync(target) && !request.overwrite) throw new Error(`Output exists; set overwrite:true: ${target}`);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, decoded.bytes);
+    await withFileMutationQueue(target, async () => {
+      signal?.throwIfAborted();
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, decoded.bytes, { flag: request.overwrite ? "w" : "wx" });
+    });
     saved.push(target);
   }
   return { model: request.model, saved, warnings, usage: response.usage, outputFormat: response.output_format };
@@ -944,7 +1010,8 @@ async function promptForImageRequest(ctx: ExtensionCommandContext): Promise<Imag
     return undefined;
   }
 
-  const models = await fetchImageModels(ctx.signal);
+  const key = await resolveImageApiKey("openrouter", ctx);
+  const models = await fetchImageModels(ctx.signal, key);
   if (models.length === 0) throw new Error("OpenRouter returned no image models.");
   const model = await selectFromFilteredList(ctx, "Select an OpenRouter image model", modelSelectItems(models));
   if (model === null) return undefined;
@@ -952,7 +1019,7 @@ async function promptForImageRequest(ctx: ExtensionCommandContext): Promise<Imag
   const prompt = await askRequiredEditor(ctx, "Image prompt");
   if (prompt === undefined) return undefined;
 
-  const discovery = await discoverModel(model, ctx.signal);
+  const discovery = await discoverModel(model, ctx.signal, key);
   const request: ImageToolInput = { model, prompt, output: "" };
   if (!await configureImageParameters(ctx, request, discovery)) return undefined;
 
@@ -985,12 +1052,18 @@ export default function piOpenRouterImage(pi: ExtensionAPI): void {
     description: "Generate or edit images through OpenRouter's standardized /api/v1/images API. The default and recommended model is meta/muse-image. Supports local/URL reference images, input_references, Muse options, moderation, provider routing, output format validation, and capability warnings with request metadata in the tool result.",
     promptSnippet: "Generate or edit an image with OpenRouter; default/recommended model: meta/muse-image",
     parameters: imageToolSchema,
+    outputSchema: imageResultSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const result = await generate(normalizeInput(params), signal);
+      const key = await resolveImageApiKey("openrouter", ctx);
+      const result = await generate(normalizeInput(params), signal, key);
       if (Array.isArray(result.warnings) && result.warnings.length) {
         ctx.ui.notify(result.warnings.join("\n"), "warning");
       }
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: result,
+        structuredContent: JSON.parse(JSON.stringify(result)),
+      };
     },
   });
 
@@ -1003,7 +1076,8 @@ export default function piOpenRouterImage(pi: ExtensionAPI): void {
           ctx.ui.notify("OpenRouter image cancelled.", "info");
           return;
         }
-        const result = await generate(request, ctx.signal);
+        const key = await resolveImageApiKey("openrouter", ctx);
+        const result = await generate(request, ctx.signal, key);
         if (Array.isArray(result.warnings) && result.warnings.length) {
           ctx.ui.notify(result.warnings.join("\n"), "warning");
         }
